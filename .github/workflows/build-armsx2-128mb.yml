@@ -1,0 +1,122 @@
+name: Build ARMSX2 128MB Test APK
+
+on:
+  push:
+    branches:
+      - armsx2-128mb-build
+  workflow_dispatch:
+
+jobs:
+  probe-and-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl jq unzip zip python3 build-essential cmake ninja-build openjdk-17-jdk
+
+      - name: Clone ARMSX2
+        run: |
+          git clone --recursive https://github.com/ARMSX2/ARMSX2.git ARMSX2
+          cd ARMSX2
+          git rev-parse HEAD | tee ../ARMSX2_HEAD.txt
+          echo "--- root ---"
+          find . -maxdepth 2 -type f \( -name 'settings.gradle*' -o -name 'build.gradle*' -o -name 'gradlew' -o -name 'CMakeLists.txt' -o -name 'gradle.properties' \) -print | sort
+          echo "--- android markers ---"
+          find . -maxdepth 4 -type f \( -name 'AndroidManifest.xml' -o -name 'build.gradle*' -o -name 'CMakeLists.txt' \) -print | sort | head -200
+
+      - name: Inspect memory and texture code
+        run: |
+          cd ARMSX2
+          echo "--- memory files ---"
+          grep -R "static.*MainRam\|ExposedRam\|TotalRam\|memSetExtraMemMode\|32 MB main memory" -n pcsx2 common 2>/dev/null | head -200 || true
+          echo "--- texture replacement files ---"
+          grep -R "GSTextureReplacements\|LoadTextureReplacements\|DumpReplaceableTextures" -n pcsx2 2>/dev/null | head -200 || true
+
+      - name: Apply JDHalfrack-style 128MB RAM patch if compatible
+        run: |
+          cd ARMSX2
+          python3 - <<'PY'
+          from pathlib import Path
+          mt = Path('pcsx2/MemoryTypes.h')
+          if not mt.exists():
+              raise SystemExit('pcsx2/MemoryTypes.h not found; cannot patch memory model')
+          s = mt.read_text()
+          original = s
+          replacements = [
+              ('static const uint MainRam\t= _32mb;\t\t\t// 32 MB main memory!', 'static const uint MainRam\t= _1mb * 128;\t\t// 128 MB main memory extended build'),
+              ('static constexpr u32 MainRam = _32mb;      // 32 MB main memory.', 'static constexpr u32 MainRam = _1mb * 128; // 128 MB main memory extended build.'),
+              ('u8 Main[Ps2MemSize::MainRam];\t\t\t// Main memory (hard-wired to 32MB)', 'u8 Main[Ps2MemSize::MainRam];\t\t\t// Main memory (128 MB extended build)'),
+          ]
+          for old,new in replacements:
+              s = s.replace(old,new)
+          if s == original:
+              print(original[:2000])
+              raise SystemExit('No known MainRam pattern patched; source layout differs')
+          mt.write_text(s)
+
+          # Direct-memory masks in older PCSX2-style code.
+          mh = Path('pcsx2/Memory.h')
+          if mh.exists():
+              x = mh.read_text()
+              x2 = x.replace('& 0x1ffffff]', '& (Ps2MemSize::MainRam - 1)]')
+              mh.write_text(x2)
+              print('Memory.h direct masks changed:', x.count('& 0x1ffffff]'), '->', x2.count('& 0x1ffffff]'))
+
+          # vtlb fastmem bound in older Aether/PCSX2-style code.
+          vt = Path('pcsx2/vtlb.cpp')
+          if vt.exists():
+              x = vt.read_text()
+              x = x.replace('if (paddr >= 0x00000000 && paddr < 0x02000000)', 'if (paddr >= 0x00000000 && paddr < Ps2MemSize::MainRam)')
+              x = x.replace('*hsize = 0x02000000 - paddr;', '*hsize = Ps2MemSize::MainRam - paddr;')
+              vt.write_text(x)
+
+          print('--- MemoryTypes.h MainRam lines ---')
+          for line in mt.read_text().splitlines():
+              if 'MainRam' in line or 'TotalRam' in line or 'ExtraRam' in line:
+                  print(line)
+          PY
+          git diff -- pcsx2/MemoryTypes.h pcsx2/Memory.h pcsx2/vtlb.cpp || true
+          git diff --check
+
+      - name: Build Android APK if Gradle project exists
+        run: |
+          cd ARMSX2
+          if [ ! -x ./gradlew ]; then
+            echo "No ./gradlew found. Cannot build Android APK directly from this tree." | tee ../BUILD_RESULT.txt
+            exit 2
+          fi
+          ./gradlew --no-daemon tasks | tee ../gradle_tasks.txt
+          # Try common Android assemble tasks in order.
+          if ./gradlew --no-daemon assembleRelease; then
+            echo assembleRelease > ../BUILD_RESULT.txt
+          elif ./gradlew --no-daemon assembleDebug; then
+            echo assembleDebug > ../BUILD_RESULT.txt
+          else
+            echo "Gradle project exists but no assemble task succeeded" | tee ../BUILD_RESULT.txt
+            exit 3
+          fi
+
+      - name: Collect APKs and patch
+        if: always()
+        run: |
+          mkdir -p artifact
+          cp ARMSX2_HEAD.txt artifact/ || true
+          cp BUILD_RESULT.txt artifact/ || true
+          cp gradle_tasks.txt artifact/ || true
+          cd ARMSX2
+          git diff > ../artifact/armsx2-128mb.patch || true
+          find . -type f -name '*.apk' -print -exec cp {} ../artifact/ \; || true
+          cd ..
+          find artifact -maxdepth 1 -type f -print -exec sha256sum {} \; || true
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: armsx2-128mb-test-output
+          path: artifact/
+          if-no-files-found: warn
+          compression-level: 0
