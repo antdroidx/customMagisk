@@ -1,10 +1,154 @@
 name: Build ARMSX2 128MB Universal Android APK
 
 on:
+  push:
+    branches:
+      - armsx2-128mb-build
+    paths:
+      - '.github/workflows/build-armsx2-128mb-universal.yml'
   workflow_dispatch:
 
 jobs:
-  disabled:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
     steps:
-      - run: echo "Push trigger disabled after starting the EE-interpreter 128MB test build."
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip python3 openjdk-17-jdk ninja-build
+
+      - name: Prepare Android SDK, Rust target, and debug keystore
+        run: |
+          set -euxo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          rustup target add aarch64-linux-android
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" || true
+          fi
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -noprompt \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android \
+              -keypass android \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Clone ARMSX2
+        run: |
+          git clone https://github.com/ARMSX2/ARMSX2.git ARMSX2
+          cd ARMSX2
+          git rev-parse HEAD | tee ../ARMSX2_HEAD.txt
+
+      - name: Populate shaderc third-party dependencies
+        run: |
+          set -euxo pipefail
+          cd ARMSX2/platforms/android/app/src/main/cpp/3rdparty/shaderc/third_party
+
+          fetch_dep() {
+            local url="$1"
+            local rev="$2"
+            local dir="$3"
+            rm -rf "$dir"
+            git clone --depth 1 --filter=blob:none "$url" "$dir"
+            cd "$dir"
+            git fetch --depth 1 origin "$rev"
+            git checkout --detach FETCH_HEAD
+            cd - >/dev/null
+          }
+
+          fetch_dep https://github.com/KhronosGroup/SPIRV-Headers.git 465055f6c9128772e20082e893d974146acf7a02 spirv-headers
+          fetch_dep https://github.com/KhronosGroup/SPIRV-Tools.git e4bceacf59fdfe742047e94e41ef65a48999a0dd spirv-tools
+          fetch_dep https://github.com/KhronosGroup/glslang.git 09c541ee5b22bbac307987b50d86ec2b4f683d75 glslang
+
+      - name: Force full 128MB extra RAM path and EE interpreter
+        run: |
+          cd ARMSX2
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def write(path, text):
+              Path(path).write_text(text)
+
+          # Memory.cpp: force exposed RAM and force-disable EE recompiler instead of refusing extra RAM on ARM64.
+          p = Path('pcsx2/Memory.cpp')
+          s = p.read_text()
+          s = s.replace('u32 ExposedRam = MainRam;', 'u32 ExposedRam = TotalRam;')
+          s = s.replace('u32 ExposedIopRam = IopRam;', 'u32 ExposedIopRam = TotalIopRam;')
+          s = s.replace('static bool s_extra_memory = false;', 'static bool s_extra_memory = true;')
+          old_guard = '''\tif (mode && EmuConfig.Cpu.Recompiler.EnableEE)\n\t{\n\t\tConsole.Warning("Extended RAM (128MB) is not supported by the ARM64 EE recompiler; ignoring it. "\n\t\t\t\t\t\t"Disable the EE recompiler if you need it.");\n\t\tmode = false;\n\t}\n'''
+          new_guard = '''\tif (mode && EmuConfig.Cpu.Recompiler.EnableEE)\n\t{\n\t\tEmuConfig.Cpu.Recompiler.EnableEE = false;\n\t\tConsole.Warning("NCAA 128MB Android test: forcing EE interpreter because ARM64 EE recompiler is MainRam-only.");\n\t}\n'''
+          if old_guard in s:
+              s = s.replace(old_guard, new_guard)
+          alloc_marker = 'bool SysMemory::Allocate()\n{\n\tDevCon.WriteLn(Color_StrongBlue, "Allocating host memory for virtual systems...");\n'
+          alloc_insert = 'bool SysMemory::Allocate()\n{\n\tDevCon.WriteLn(Color_StrongBlue, "Allocating host memory for virtual systems...");\n\n#ifdef ARCH_ARM64\n\tEmuConfig.Cpu.Recompiler.EnableEE = false;\n\tConsole.Warning("NCAA 128MB Android test: forcing EE interpreter before memory allocation.");\n#endif\n'
+          if alloc_marker in s and 'forcing EE interpreter before memory allocation' not in s:
+              s = s.replace(alloc_marker, alloc_insert)
+          p.write_text(s)
+
+          # R5900.cpp: add extra RAM virtual mappings during EELOAD hook, like PCSX2 PR #11111.
+          p = Path('pcsx2/R5900.cpp')
+          s = p.read_text()
+          if '#include "Memory.h"' not in s:
+              s = s.replace('#include "R5900.h"\n', '#include "R5900.h"\n#include "Memory.h"\n#include "vtlb.h"\n')
+          hook_call = '\tVMManager::Internal::ELFLoadingOnCPUThread(std::move(elfname));\n'
+          hook_insert = '''\tVMManager::Internal::ELFLoadingOnCPUThread(std::move(elfname));\n\n\tif (memGetExtraMemMode())\n\t{\n\t\t// Map extra memory and RAM mirrors for devkit-style 128MB mode.\n\t\tvtlb_VMap(Ps2MemSize::MainRam, Ps2MemSize::MainRam, Ps2MemSize::ExtraRam);\n\t\tvtlb_VMap(0x20000000 | Ps2MemSize::MainRam, Ps2MemSize::MainRam, Ps2MemSize::ExtraRam);\n\t\tvtlb_VMap(0x30000000 | Ps2MemSize::MainRam, Ps2MemSize::MainRam, Ps2MemSize::ExtraRam);\n\t}\n'''
+          if hook_call in s and 'Map extra memory and RAM mirrors for devkit-style 128MB mode' not in s:
+              s = s.replace(hook_call, hook_insert)
+          p.write_text(s)
+
+          # R5900OpcodeImpl.cpp: HLE syscalls RFU060 and GetMemorySize so games discover/use 128MB properly.
+          p = Path('pcsx2/R5900OpcodeImpl.cpp')
+          s = p.read_text()
+          if '#include "Memory.h"' not in s:
+              s = s.replace('#include "R5900.h"\n', '#include "R5900.h"\n#include "Memory.h"\n')
+          setosd = '\t\tcase Syscall::SetOsdConfigParam:\n'
+          rfu_case = '''\t\tcase Syscall::RFU060:\n\t\t\tif (memGetExtraMemMode() && cpuRegs.GPR.n.a1.UL[0] == 0xFFFFFFFF)\n\t\t\t{\n\t\t\t\tcpuRegs.GPR.n.a1.UL[0] = Ps2MemSize::ExposedRam - cpuRegs.GPR.n.a2.SL[0];\n\t\t\t}\n\t\t\tbreak;\n'''
+          if setosd in s and 'case Syscall::RFU060:' not in s:
+              s = s.replace(setosd, rfu_case + setosd)
+          default_marker = '\t\tdefault:\n'
+          getmem_case = '''\t\tcase Syscall::GetMemorySize:\n\t\t\tif (memGetExtraMemMode())\n\t\t\t{\n\t\t\t\tcpuRegs.GPR.n.v0.UL[0] = Ps2MemSize::ExposedRam;\n\t\t\t\treturn;\n\t\t\t}\n\t\t\tbreak;\n\n'''
+          if default_marker in s and 'case Syscall::GetMemorySize:' not in s:
+              s = s.replace(default_marker, getmem_case + default_marker)
+          p.write_text(s)
+
+          for f in ['pcsx2/Memory.cpp', 'pcsx2/R5900.cpp', 'pcsx2/R5900OpcodeImpl.cpp']:
+              print(f'patched {f}')
+          PY
+          git diff -- pcsx2/Memory.cpp pcsx2/R5900.cpp pcsx2/R5900OpcodeImpl.cpp pcsx2/Dmac.cpp pcsx2/vtlb.cpp > ../armsx2-128mb-fullmem-eeinterp.patch
+          git diff --check
+
+      - name: Build universal APK
+        run: |
+          set -euxo pipefail
+          cd ARMSX2/platforms/android
+          chmod +x gradlew tools/build-universal-page-apk.sh
+          ./tools/build-universal-page-apk.sh "$GITHUB_WORKSPACE/ARMSX2-128MB-FULLMEM-EEinterp-universal-test.apk" --application-id com.armsx2.extmemfullinterp
+          cd "$GITHUB_WORKSPACE"
+          sha256sum ARMSX2-128MB-FULLMEM-EEinterp-universal-test.apk | tee ARMSX2-128MB-FULLMEM-EEinterp-universal-test.sha256
+
+      - name: Collect artifact
+        if: always()
+        run: |
+          mkdir -p artifact
+          cp ARMSX2_HEAD.txt artifact/ || true
+          cp armsx2-128mb-fullmem-eeinterp.patch artifact/ || true
+          cp ARMSX2-128MB-FULLMEM-EEinterp-universal-test.apk artifact/ || true
+          cp ARMSX2-128MB-FULLMEM-EEinterp-universal-test.sha256 artifact/ || true
+          find artifact -maxdepth 1 -type f -print -exec ls -lh {} \;
+
+      - name: Upload APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ARMSX2-128MB-FULLMEM-EEinterp-universal-test
+          path: artifact/
+          if-no-files-found: warn
+          compression-level: 0
