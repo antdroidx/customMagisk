@@ -1,0 +1,187 @@
+name: Build AetherSX2 128MB Core
+
+on:
+  push:
+    branches:
+      - aethersx2-128mb-build
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build git wget unzip openssl
+
+      - name: Download Android NDK r23c
+        run: |
+          wget -q --show-progress https://dl.google.com/android/repository/android-ndk-r23c-linux.zip
+          echo "e5053c126a47e84726d9f7173a04686a71f9a67a  android-ndk-r23c-linux.zip" | sha1sum -c -
+          unzip -q android-ndk-r23c-linux.zip
+          echo "ANDROID_NDK_ROOT=$PWD/android-ndk-r23c" >> "$GITHUB_ENV"
+
+      - name: Clone matching AetherSX2 source
+        run: |
+          git clone https://github.com/MrPurple666/AetherSX2.git AetherSX2
+          cd AetherSX2
+          git checkout 1a5ebd1a8e74e73ee91e96b36faf78650c12b766
+
+      - name: Apply 128 MiB EE RAM patch
+        run: |
+          cd AetherSX2
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new, count=None):
+              p = Path(path)
+              s = p.read_text()
+              if old not in s:
+                  raise SystemExit(f"Pattern not found in {path}: {old!r}")
+              s2 = s.replace(old, new, count if count is not None else -1)
+              p.write_text(s2)
+
+          # Expand the EE backing allocation from retail 32 MiB to 128 MiB.
+          replace(
+              "pcsx2/MemoryTypes.h",
+              "static const uint MainRam\t= _32mb;\t\t\t// 32 MB main memory!",
+              "static const uint MainRam\t= _1mb * 128;\t\t// 128 MB main memory (32 MB retail + 96 MB extended)",
+              1,
+          )
+          replace(
+              "pcsx2/MemoryTypes.h",
+              "u8 Main[Ps2MemSize::MainRam];\t\t\t// Main memory (hard-wired to 32MB)",
+              "u8 Main[Ps2MemSize::MainRam];\t\t\t// Main memory (128 MB extended EE RAM)",
+              1,
+          )
+
+          # Direct EE RAM helpers must address the entire power-of-two 128 MiB block.
+          p = Path("pcsx2/Memory.h")
+          s = p.read_text()
+          old = "& 0x1ffffff]"
+          if s.count(old) != 8:
+              raise SystemExit(f"Expected 8 direct EE RAM masks, found {s.count(old)}")
+          s = s.replace(old, "& (Ps2MemSize::MainRam - 1)]")
+          p.write_text(s)
+
+          # Fastmem must recognize the whole expanded EE RAM backing range.
+          replace(
+              "pcsx2/vtlb.cpp",
+              "if (paddr >= 0x00000000 && paddr < 0x02000000)",
+              "if (paddr >= 0x00000000 && paddr < Ps2MemSize::MainRam)",
+              1,
+          )
+          replace(
+              "pcsx2/vtlb.cpp",
+              "*hsize = 0x02000000 - paddr;",
+              "*hsize = Ps2MemSize::MainRam - paddr;",
+              1,
+          )
+
+          # On ARM64 the old host layout placed IOP at +64 MiB and VU at +128 MiB.
+          # The expanded EE struct is ~136.5 MiB, so move IOP/VU above it while
+          # preserving the existing bump allocator and overall 320 MiB main reserve.
+          p = Path("pcsx2/System.h")
+          s = p.read_text()
+          pre, sep, post = s.partition("#else")
+          if not sep:
+              raise SystemExit("ARM64 HostMemoryMap branch not found")
+          old = """\t// IOP main memory and ROMs
+          \tstatic const u32 IOPmemOffset  = 0x04000000;
+
+          \t// VU0 and VU1 memory.
+          \tstatic const u32 VUmemOffset   = 0x08000000;"""
+          new = """\t// IOP main memory and ROMs. Moved above expanded 128 MiB EE memory.
+          \tstatic const u32 IOPmemOffset  = 0x0A000000;
+
+          \t// VU0 and VU1 memory.
+          \tstatic const u32 VUmemOffset   = 0x0C000000;"""
+          if old not in post:
+              raise SystemExit("ARM64 host-memory offsets not found")
+          post = post.replace(old, new, 1)
+          p.write_text(pre + sep + post)
+
+          # HLE GetMemorySize so software querying the BIOS sees 128 MiB.
+          replace(
+              "pcsx2/R5900OpcodeTables.h",
+              "\tDeci2Call = 124\n",
+              "\tDeci2Call = 124,\n\tGetMemorySize = 127\n",
+              1,
+          )
+          p = Path("pcsx2/R5900OpcodeImpl.cpp")
+          s = p.read_text()
+          marker = """\n\t\tdefault:
+          \t\t\tbreak;
+          \t}
+          """
+          insert = """
+          \n\t\tcase Syscall::GetMemorySize:
+          \t\t{
+          \t\t\t// Extended-memory build: report the full 128 MiB EE RAM size.
+          \t\t\tcpuRegs.GPR.n.v0.UL[0] = Ps2MemSize::MainRam;
+          \t\t\treturn;
+          \t\t}
+          """
+          if marker not in s:
+              raise SystemExit("SYSCALL default marker not found")
+          s = s.replace(marker, insert + marker, 1)
+          p.write_text(s)
+
+          # Debugger-side validity check should include extended RAM too.
+          replace(
+              "pcsx2/DebugTools/DebugInterface.cpp",
+              "if (lopart >= 0x80000 && lopart <= 0x1ffFFff)",
+              "if (lopart >= 0x80000 && lopart < Ps2MemSize::MainRam)",
+              1,
+          )
+
+          # Keep savestate comments accurate; MainRam already controls serialized size.
+          p = Path("pcsx2/SaveState.cpp")
+          p.write_text(p.read_text().replace(
+              "// 32 MB main memory",
+              "// EE main memory (128 MB in extended build)",
+              1,
+          ))
+          PY
+
+          echo "---- 128MB patch verification ----"
+          grep -n "MainRam" pcsx2/MemoryTypes.h | head
+          grep -n "IOPmemOffset\|VUmemOffset" pcsx2/System.h
+          grep -n "GetMemorySize" pcsx2/R5900OpcodeTables.h pcsx2/R5900OpcodeImpl.cpp
+          git diff --check
+          git diff
+
+      - name: Configure Android ARM64 build
+        run: |
+          cmake -S AetherSX2 -B build-android \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DANDROID_PLATFORM=android-26 \
+            -DANDROID_ABI=arm64-v8a
+
+      - name: Build libemucore
+        run: |
+          cmake --build build-android --parallel 4
+          test -f build-android/pcsx2/libemucore.so
+          file build-android/pcsx2/libemucore.so
+          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h build-android/pcsx2/libemucore.so
+
+      - name: Package build artifact
+        run: |
+          mkdir -p artifact
+          cp build-android/pcsx2/libemucore.so artifact/libemucore-128mb.so
+          cp AetherSX2/pcsx2/MemoryTypes.h artifact/MemoryTypes-128mb.h
+          cp AetherSX2/pcsx2/System.h artifact/System-128mb.h
+          cd AetherSX2
+          git diff > ../artifact/aethersx2-128mb.patch
+
+      - name: Upload core
+        uses: actions/upload-artifact@v4
+        with:
+          name: aethersx2-128mb-core
+          path: artifact/
+          if-no-files-found: error
+          compression-level: 0
