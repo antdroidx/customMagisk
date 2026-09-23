@@ -1,0 +1,55 @@
+name: Port PCSX2 4029 Textures Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - aethersx2-4029-textures
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Clone Aether and PCSX2
+        run: |
+          git clone https://github.com/MrPurple666/AetherSX2.git Aether
+          cd Aether
+          git checkout 0c0dd07fecc5202be0c95367050225f6630468c9
+          git config user.email "build@example.invalid"
+          git config user.name "build"
+          git remote add pcsx2 https://github.com/PCSX2/pcsx2.git
+          git fetch --no-tags pcsx2 32dc68f10332798ce6df27321f00ee2e3ef45b49 5a25cc171dd4ff6da59a09763342a55986624d54
+
+      - name: Apply original texture replacement feature patch
+        run: |
+          cd Aether
+          git diff --binary 32dc68f10332798ce6df27321f00ee2e3ef45b49 5a25cc171dd4ff6da59a09763342a55986624d54 -- \
+            pcsx2/CMakeLists.txt \
+            pcsx2/Config.h \
+            pcsx2/Pcsx2Config.cpp \
+            pcsx2/PathDefs.h \
+            pcsx2/GS/GS.cpp \
+            pcsx2/GS/Renderers/HW/GSRendererHW.cpp \
+            pcsx2/GS/Renderers/HW/GSTextureCache.cpp \
+            pcsx2/GS/Renderers/HW/GSTextureCache.h \
+            pcsx2/GS/Renderers/HW/GSTextureReplacementLoaders.cpp \
+            pcsx2/GS/Renderers/HW/GSTextureReplacements.cpp \
+            pcsx2/GS/Renderers/HW/GSTextureReplacements.h > ../texture-initial.patch
+          git apply --3way --index ../texture-initial.patch
+          git diff --cached --check
+          git status --short
+
+      - name: Upload patched tree diff
+        if: always()
+        run: |
+          cd Aether
+          git diff --cached --binary > ../applied.patch || true
+          git diff > ../working.patch || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: 4029-port-check
+          path: |
+            texture-initial.patch
+            applied.patch
+            working.patch
