@@ -1,0 +1,101 @@
+name: Build ARMSX2 128MB Universal Android APK
+
+on:
+  push:
+    branches:
+      - armsx2-128mb-build
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl jq unzip zip python3 python3-pip build-essential cmake ninja-build openjdk-17-jdk
+
+      - name: Clone ARMSX2
+        run: |
+          git clone --recursive https://github.com/ARMSX2/ARMSX2.git ARMSX2
+          cd ARMSX2
+          git rev-parse HEAD | tee ../ARMSX2_HEAD.txt
+          find platforms/android -maxdepth 3 -type f \( -name 'README.md' -o -name 'build.gradle*' -o -name 'settings.gradle*' \) -print | sort || true
+
+      - name: Apply 128MB EE RAM patch
+        run: |
+          cd ARMSX2
+          python3 - <<'PY'
+          from pathlib import Path
+          mt = Path('pcsx2/MemoryTypes.h')
+          if not mt.exists():
+              raise SystemExit('pcsx2/MemoryTypes.h not found')
+          s = mt.read_text()
+          original = s
+          patterns = [
+              ('static const uint MainRam\t= _32mb;\t\t\t// 32 MB main memory!', 'static const uint MainRam\t= _1mb * 128;\t\t// 128 MB main memory extended build'),
+              ('static constexpr u32 MainRam = _32mb;      // 32 MB main memory.', 'static constexpr u32 MainRam = _1mb * 128; // 128 MB main memory extended build.'),
+              ('static constexpr u32 MainRam = _32mb; // 32 MB main memory.', 'static constexpr u32 MainRam = _1mb * 128; // 128 MB main memory extended build.'),
+              ('u8 Main[Ps2MemSize::MainRam];\t\t\t// Main memory (hard-wired to 32MB)', 'u8 Main[Ps2MemSize::MainRam];\t\t\t// Main memory (128 MB extended build)'),
+          ]
+          for old, new in patterns:
+              s = s.replace(old, new)
+          if s == original:
+              print('Could not apply simple MemoryTypes.h patch. Current MainRam lines:')
+              for line in original.splitlines():
+                  if 'MainRam' in line or 'TotalRam' in line or 'ExtraRam' in line:
+                      print(line)
+              raise SystemExit(10)
+          mt.write_text(s)
+
+          mh = Path('pcsx2/Memory.h')
+          if mh.exists():
+              x = mh.read_text()
+              x2 = x.replace('& 0x1ffffff]', '& (Ps2MemSize::MainRam - 1)]')
+              mh.write_text(x2)
+              print('Memory.h 0x1ffffff direct masks replaced:', x.count('& 0x1ffffff]'))
+
+          vt = Path('pcsx2/vtlb.cpp')
+          if vt.exists():
+              x = vt.read_text()
+              x = x.replace('if (paddr >= 0x00000000 && paddr < 0x02000000)', 'if (paddr >= 0x00000000 && paddr < Ps2MemSize::MainRam)')
+              x = x.replace('*hsize = 0x02000000 - paddr;', '*hsize = Ps2MemSize::MainRam - paddr;')
+              vt.write_text(x)
+
+          print('--- patched RAM lines ---')
+          for line in mt.read_text().splitlines():
+              if 'MainRam' in line or 'ExtraRam' in line or 'TotalRam' in line or 'ExposedRam' in line:
+                  print(line)
+          PY
+          git diff --check
+          git diff > ../armsx2-128mb.patch
+
+      - name: Build universal Android APK
+        run: |
+          cd ARMSX2
+          chmod +x tools/build-universal-page-apk.sh || true
+          ./tools/build-universal-page-apk.sh ../ARMSX2-128MB-universal-test.apk
+          cd ..
+          test -f ARMSX2-128MB-universal-test.apk
+          sha256sum ARMSX2-128MB-universal-test.apk | tee ARMSX2-128MB-universal-test.sha256
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p artifact
+          cp ARMSX2_HEAD.txt artifact/ || true
+          cp armsx2-128mb.patch artifact/ || true
+          cp ARMSX2-128MB-universal-test.apk artifact/ || true
+          cp ARMSX2-128MB-universal-test.sha256 artifact/ || true
+          find artifact -maxdepth 1 -type f -print -exec ls -lh {} \;
+
+      - name: Upload APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ARMSX2-128MB-universal-test
+          path: artifact/
+          if-no-files-found: warn
+          compression-level: 0
