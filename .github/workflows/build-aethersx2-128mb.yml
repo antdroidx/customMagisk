@@ -178,6 +178,11 @@ jobs:
           cd AetherSX2
           git diff > ../artifact/aethersx2-128mb.patch
 
+      - name: Include Android APK signer
+        run: |
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          cp "$BUILD_TOOLS/lib/apksigner.jar" artifact/apksigner.jar
+
       - name: Upload core
         uses: actions/upload-artifact@v4
         with:
