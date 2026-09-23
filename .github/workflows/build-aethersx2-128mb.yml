@@ -178,15 +178,41 @@ jobs:
           cd AetherSX2
           git diff > ../artifact/aethersx2-128mb.patch
 
-      - name: Include Android APK signer
+      - name: Build compatible PurpleSX2 128MB APK
         run: |
-          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
-          cp "$BUILD_TOOLS/lib/apksigner.jar" artifact/apksigner.jar
+          set -euxo pipefail
 
-      - name: Upload core
+          # Strip the native core for APK use.
+          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-unneeded build-android/pcsx2/libemucore.so
+          cp build-android/pcsx2/libemucore.so artifact/libemucore-128mb-stripped.so
+
+          # Download the exact shell APK linked by the source project's README.
+          python3 -m pip install --quiet gdown
+          python3 -m gdown 1FoLijHU4w9T82frNr145jE_IalYmuIDC -O purplesx2-shell.apk
+          unzip -t purplesx2-shell.apk >/dev/null
+
+          cp purplesx2-shell.apk purplesx2-128mb-unsigned.apk
+          zip -q -d purplesx2-128mb-unsigned.apk 'META-INF/*' 'lib/arm64-v8a/libemucore.so' || true
+          mkdir -p apk-lib/lib/arm64-v8a
+          cp artifact/libemucore-128mb-stripped.so apk-lib/lib/arm64-v8a/libemucore.so
+          (cd apk-lib && zip -q -0 ../purplesx2-128mb-unsigned.apk lib/arm64-v8a/libemucore.so)
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BUILD_TOOLS/zipalign" -f -p 4 purplesx2-128mb-unsigned.apk purplesx2-128mb-aligned.apk
+
+          PASS="$(openssl rand -hex 16)"
+          keytool -genkeypair -noprompt             -keystore test-signing.jks             -storepass "$PASS"             -keypass "$PASS"             -alias test             -keyalg RSA             -keysize 2048             -validity 3650             -dname "CN=AetherSX2 128MB Test"
+
+          "$BUILD_TOOLS/apksigner" sign             --ks test-signing.jks             --ks-pass "pass:$PASS"             --key-pass "pass:$PASS"             --ks-key-alias test             --out artifact/PurpleSX2-128MB-test.apk             purplesx2-128mb-aligned.apk
+
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs artifact/PurpleSX2-128MB-test.apk
+          unzip -l artifact/PurpleSX2-128MB-test.apk | grep 'lib/arm64-v8a/libemucore.so'
+          sha256sum artifact/PurpleSX2-128MB-test.apk | tee artifact/PurpleSX2-128MB-test.sha256
+
+      - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: aethersx2-128mb-core
+          name: purplesx2-128mb-test
           path: artifact/
           if-no-files-found: error
           compression-level: 0
