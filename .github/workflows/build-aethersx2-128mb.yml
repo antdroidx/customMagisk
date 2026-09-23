@@ -28,7 +28,7 @@ jobs:
         run: |
           git clone https://github.com/MrPurple666/AetherSX2.git AetherSX2
           cd AetherSX2
-          git checkout 1a5ebd1a8e74e73ee91e96b36faf78650c12b766
+          git checkout 0c0dd07fecc5202be0c95367050225f6630468c9
 
       - name: Apply 128 MiB EE RAM patch
         run: |
