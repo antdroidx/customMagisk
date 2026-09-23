@@ -1,0 +1,41 @@
+name: Analyze NetherSX2 JNI
+
+on:
+  push:
+    branches:
+      - aethersx2-128mb-build
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download APK
+        run: |
+          wget -q https://github.com/Trixarian/NetherSX2-classic/releases/download/2.2n/NetherSX2-v2.2n-3668.apk -O Nether.apk
+          echo "8b502b31ce797d5a162bc6b9300b5f02351b0b6b290b8dc1390b8dfb826673ab  Nether.apk" | sha256sum -c -
+          unzip -q Nether.apk classes.dex
+      - name: Dump NativeLibrary signatures
+        run: |
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BUILD_TOOLS/dexdump" -d classes.dex > dexdump.txt
+          python3 - <<'PY'
+          import re
+          txt=open("dexdump.txt",errors="ignore").read().splitlines()
+          out=[]
+          in_class=False
+          buf=[]
+          for line in txt:
+              if "Class descriptor" in line:
+                  in_class = "Lxyz/aethersx2/android/NativeLibrary;" in line
+              if in_class:
+                  buf.append(line)
+              elif buf:
+                  break
+          open("NativeLibrary-dexdump.txt","w").write("\n".join(buf))
+          print("\n".join(buf[:5000]))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nether-jni-signatures
+          path: NativeLibrary-dexdump.txt
