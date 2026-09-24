@@ -1,10 +1,83 @@
 name: Build ARMSX2 128MB Universal Android APK
 
 on:
+  push:
+    branches: [ armsx2-128mb-build ]
   workflow_dispatch:
 
 jobs:
-  disabled:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Push trigger disabled after starting the shaderc-guard hard EE-interpreter fullmem test build."
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y git build-essential cmake ninja-build ccache zip unzip openjdk-17-jdk python3 curl nasm pkg-config libgtk-3-dev libpulse-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev libwayland-dev libxkbcommon-dev libaio-dev libudev-dev
+
+      - name: Prepare Android SDK, Rust target, and debug keystore
+        run: |
+          set -eux
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          rustup target add aarch64-linux-android || true
+          mkdir -p ~/.android
+          keytool -genkeypair -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" || true
+
+      - name: Clone pinned ARMSX2 with old universal APK helper
+        run: |
+          set -eux
+          git clone https://github.com/ARMSX2/ARMSX2.git ARMSX2
+          cd ARMSX2
+          git -c advice.detachedHead=false checkout c5102467909758906bd5380f8d20b5ef4ed027ce
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/ARMSX2_HEAD.txt"
+          test -x tools/build-universal-page-apk.sh
+
+      - name: Populate shaderc third-party dependencies if needed
+        run: |
+          set -eux
+          if [ -d ARMSX2/3rdparty/shaderc/third_party ]; then
+            cd ARMSX2/3rdparty/shaderc/third_party
+            rm -rf spirv-headers spirv-tools glslang
+            git clone https://github.com/KhronosGroup/SPIRV-Headers.git spirv-headers
+            git clone https://github.com/KhronosGroup/SPIRV-Tools.git spirv-tools
+            git clone https://github.com/KhronosGroup/glslang.git glslang
+            cd spirv-headers && git checkout 465055f6c9128772e20082e893d974146acf7a02 && cd ..
+            cd spirv-tools && git checkout e4bceacf59fdfe742047e94e41ef65a48999a0dd && cd ..
+            cd glslang && git checkout 09c541ee5b22bbac307987b50d86ec2b4f683d75 && cd ..
+          else
+            echo "ARMSX2/3rdparty/shaderc/third_party does not exist in this ARMSX2 checkout; skipping legacy shaderc dependency population."
+          fi
+
+      - name: Force hard EE interpreter fullmem path
+        run: |
+          set -eux
+          python3 .github/scripts/patch_armsx2_hardinterp.py ARMSX2
+          cd ARMSX2
+          git diff -- pcsx2/Memory.cpp pcsx2/R5900.cpp pcsx2/R5900OpcodeImpl.cpp pcsx2/VMManager.cpp > "$GITHUB_WORKSPACE/armsx2-128mb-hardinterp.patch"
+          cat "$GITHUB_WORKSPACE/armsx2-128mb-hardinterp.patch"
+
+      - name: Build universal APK
+        run: |
+          set -eux
+          cd ARMSX2
+          ./tools/build-universal-page-apk.sh "$GITHUB_WORKSPACE/ARMSX2-128MB-HARDINTERP-universal-test.apk" --application-id com.armsx2.extmemhardinterp
+          sha256sum "$GITHUB_WORKSPACE/ARMSX2-128MB-HARDINTERP-universal-test.apk" | tee "$GITHUB_WORKSPACE/ARMSX2-128MB-HARDINTERP-universal-test.sha256"
+
+      - name: Collect artifact
+        run: |
+          set -eux
+          ls -lh "$GITHUB_WORKSPACE"/ARMSX2-128MB-HARDINTERP-universal-test.apk "$GITHUB_WORKSPACE"/ARMSX2-128MB-HARDINTERP-universal-test.sha256 "$GITHUB_WORKSPACE"/ARMSX2_HEAD.txt "$GITHUB_WORKSPACE"/armsx2-128mb-hardinterp.patch
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ARMSX2-128MB-HARDINTERP-universal-test
+          path: |
+            ARMSX2-128MB-HARDINTERP-universal-test.apk
+            ARMSX2-128MB-HARDINTERP-universal-test.sha256
+            ARMSX2_HEAD.txt
+            armsx2-128mb-hardinterp.patch
