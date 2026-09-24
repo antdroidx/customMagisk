@@ -1,10 +1,115 @@
 name: Build ARMSX2 128MB Universal Android APK
 
 on:
+  push:
+    branches:
+      - armsx2-128mb-build
+    paths:
+      - '.github/workflows/build-armsx2-128mb-universal.yml'
   workflow_dispatch:
 
 jobs:
-  disabled:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
     steps:
-      - run: echo "Push trigger disabled after starting the pinned hard EE-interpreter fullmem test build."
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip python3 openjdk-17-jdk ninja-build cmake ccache build-essential
+
+      - name: Prepare Android SDK, Rust target, and debug keystore
+        run: |
+          set -euxo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-}"
+          rustup target add aarch64-linux-android || true
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" || true
+          fi
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -noprompt \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android \
+              -keypass android \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Clone ARMSX2
+        run: |
+          set -euxo pipefail
+          git clone https://github.com/ARMSX2/ARMSX2.git ARMSX2
+          cd ARMSX2
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/ARMSX2_HEAD.txt"
+          test -f platforms/android/tools/build-universal-page-apk.sh
+
+      - name: Populate shaderc third-party dependencies if needed
+        run: |
+          set -euxo pipefail
+          if [ -d ARMSX2/platforms/android/app/src/main/cpp/3rdparty/shaderc/third_party ]; then
+            cd ARMSX2/platforms/android/app/src/main/cpp/3rdparty/shaderc/third_party
+            fetch_dep() {
+              local url="$1"
+              local rev="$2"
+              local dir="$3"
+              rm -rf "$dir"
+              git clone --depth 1 --filter=blob:none "$url" "$dir"
+              cd "$dir"
+              git fetch --depth 1 origin "$rev"
+              git checkout --detach FETCH_HEAD
+              cd - >/dev/null
+            }
+            fetch_dep https://github.com/KhronosGroup/SPIRV-Headers.git 465055f6c9128772e20082e893d974146acf7a02 spirv-headers
+            fetch_dep https://github.com/KhronosGroup/SPIRV-Tools.git e4bceacf59fdfe742047e94e41ef65a48999a0dd spirv-tools
+            fetch_dep https://github.com/KhronosGroup/glslang.git 09c541ee5b22bbac307987b50d86ec2b4f683d75 glslang
+          else
+            echo "shaderc third_party folder not present; skipping."
+          fi
+
+      - name: Force hard EE interpreter fullmem path
+        run: |
+          set -euxo pipefail
+          python3 .github/scripts/patch_armsx2_hardinterp.py ARMSX2
+          cd ARMSX2
+          git diff -- pcsx2/Memory.cpp pcsx2/R5900.cpp pcsx2/R5900OpcodeImpl.cpp pcsx2/VMManager.cpp > "$GITHUB_WORKSPACE/armsx2-128mb-hardinterp.patch"
+          cat "$GITHUB_WORKSPACE/armsx2-128mb-hardinterp.patch"
+          git diff --check
+
+      - name: Build universal APK
+        run: |
+          set -euxo pipefail
+          cd ARMSX2/platforms/android
+          chmod +x gradlew tools/build-universal-page-apk.sh
+          ./tools/build-universal-page-apk.sh "$GITHUB_WORKSPACE/ARMSX2-128MB-HARDINTERP-universal-test.apk" --application-id com.armsx2.extmemhardinterp
+          cd "$GITHUB_WORKSPACE"
+          sha256sum ARMSX2-128MB-HARDINTERP-universal-test.apk | tee ARMSX2-128MB-HARDINTERP-universal-test.sha256
+
+      - name: Collect artifact
+        if: always()
+        run: |
+          mkdir -p artifact
+          cp ARMSX2_HEAD.txt artifact/ || true
+          cp armsx2-128mb-hardinterp.patch artifact/ || true
+          cp ARMSX2-128MB-HARDINTERP-universal-test.apk artifact/ || true
+          cp ARMSX2-128MB-HARDINTERP-universal-test.sha256 artifact/ || true
+          find artifact -maxdepth 1 -type f -print -exec ls -lh {} \;
+
+      - name: Upload APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ARMSX2-128MB-HARDINTERP-universal-test
+          path: artifact/
+          if-no-files-found: warn
+          compression-level: 0
