@@ -1,10 +1,208 @@
 name: Build ARMSX2 128MB Universal Android APK
 
 on:
+  push:
+    branches: [ armsx2-128mb-build ]
   workflow_dispatch:
 
 jobs:
-  disabled:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Push trigger disabled after starting the full extra-RAM EE-interpreter test build."
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git build-essential cmake ninja-build ccache zip unzip openjdk-17-jdk python3 curl nasm pkg-config libgtk-3-dev libpulse-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev libwayland-dev libxkbcommon-dev libaio-dev libudev-dev
+
+      - name: Prepare Android SDK, Rust target, and debug keystore
+        run: |
+          set -eux
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          rustup target add aarch64-linux-android || true
+          mkdir -p ~/.android
+          keytool -genkeypair -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" || true
+
+      - name: Clone ARMSX2
+        run: |
+          git clone --depth=1 https://github.com/ARMSX2/ARMSX2.git ARMSX2
+          cd ARMSX2
+          git rev-parse HEAD | tee "$GITHUB_WORKSPACE/ARMSX2_HEAD.txt"
+
+      - name: Populate shaderc third-party dependencies
+        run: |
+          set -eux
+          cd ARMSX2/3rdparty/shaderc/third_party
+          rm -rf spirv-headers spirv-tools glslang
+          git clone https://github.com/KhronosGroup/SPIRV-Headers.git spirv-headers
+          git clone https://github.com/KhronosGroup/SPIRV-Tools.git spirv-tools
+          git clone https://github.com/KhronosGroup/glslang.git glslang
+          cd spirv-headers && git checkout 465055f6c9128772e20082e893d974146acf7a02 && cd ..
+          cd spirv-tools && git checkout e4bceacf59fdfe742047e94e41ef65a48999a0dd && cd ..
+          cd glslang && git checkout 09c541ee5b22bbac307987b50d86ec2b4f683d75 && cd ..
+
+      - name: Force hard EE interpreter fullmem path
+        run: |
+          set -eux
+          cd ARMSX2
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def write(path, text):
+              Path(path).write_text(text)
+
+          # Memory: expose 128MB and keep extra memory enabled.
+          p = Path('pcsx2/Memory.cpp')
+          s = p.read_text()
+          s = s.replace('u32 ExposedRam = MainRam;', 'u32 ExposedRam = TotalRam;')
+          s = s.replace('u32 ExposedIopRam = IopRam;', 'u32 ExposedIopRam = TotalIopRam;')
+          s = s.replace('static bool s_extra_memory = false;', 'static bool s_extra_memory = true;')
+          alloc_needle = 'DevCon.WriteLn(Color_StrongBlue, "Allocating host memory for virtual systems...");\n\n'
+          alloc_insert = '''DevCon.WriteLn(Color_StrongBlue, "Allocating host memory for virtual systems...");
+
+#ifdef ARCH_ARM64
+\tEmuConfig.Cpu.Recompiler.EnableEE = false;
+\tEmuConfig.Cpu.Recompiler.EnableFastmem = false;
+\tConsole.Warning("NCAA 128MB Android test: hard-forcing EE interpreter and fastmem off before memory allocation.");
+#endif
+
+'''
+          if 'hard-forcing EE interpreter and fastmem off before memory allocation' not in s:
+              s = s.replace(alloc_needle, alloc_insert)
+          s = s.replace('''\tif (mode && EmuConfig.Cpu.Recompiler.EnableEE)
+\t{
+\t\tConsole.Warning("Extended RAM (128MB) is not supported by the ARM64 EE recompiler; ignoring it. "
+\t\t\t\t\t\t"Disable the EE recompiler if you need it.");
+\t\tmode = false;
+\t}
+''', '''\tif (mode && EmuConfig.Cpu.Recompiler.EnableEE)
+\t{
+\t\tEmuConfig.Cpu.Recompiler.EnableEE = false;
+\t\tEmuConfig.Cpu.Recompiler.EnableFastmem = false;
+\t\tConsole.Warning("NCAA 128MB Android test: forcing EE interpreter because ARM64 EE recompiler is MainRam-only.");
+\t}
+''')
+          write(p, s)
+
+          # R5900: ensure extra 96MB and mirrors are mapped when extra memory is active.
+          p = Path('pcsx2/R5900.cpp')
+          s = p.read_text()
+          if '#include "Memory.h"' not in s:
+              s = s.replace('#include "R5900.h"\n', '#include "R5900.h"\n#include "Memory.h"\n#include "vtlb.h"\n')
+          hook = '\tVMManager::Internal::ELFLoadingOnCPUThread(std::move(elfname));\n\n'
+          insert = '''\tVMManager::Internal::ELFLoadingOnCPUThread(std::move(elfname));
+
+\tif (memGetExtraMemMode())
+\t{
+\t\tConsole.Warning("NCAA 128MB Android test: mapping extra EE RAM in eeloadHook.");
+\t\tvtlb_VMap(Ps2MemSize::MainRam, Ps2MemSize::MainRam, Ps2MemSize::ExtraRam);
+\t\tvtlb_VMap(0x20000000 | Ps2MemSize::MainRam, Ps2MemSize::MainRam, Ps2MemSize::ExtraRam);
+\t\tvtlb_VMap(0x30000000 | Ps2MemSize::MainRam, Ps2MemSize::MainRam, Ps2MemSize::ExtraRam);
+\t}
+
+'''
+          if 'mapping extra EE RAM in eeloadHook' not in s:
+              s = s.replace(hook, insert)
+          write(p, s)
+
+          # BIOS syscalls: RFU060 and GetMemorySize must report ExposedRam.
+          p = Path('pcsx2/R5900OpcodeImpl.cpp')
+          s = p.read_text()
+          if '#include "Memory.h"' not in s:
+              s = s.replace('#include "R5900.h"\n', '#include "R5900.h"\n#include "Memory.h"\n')
+          if 'NCAA 128MB Android test: HLE RFU060' not in s:
+              marker = '\t\tcase Syscall::SetOsdConfigParam:\n'
+              block = '''\t\tcase Syscall::RFU060:
+\t\t\tif (memGetExtraMemMode() && cpuRegs.GPR.n.a1.UL[0] == 0xFFFFFFFF)
+\t\t\t{
+\t\t\t\tConsole.Warning("NCAA 128MB Android test: HLE RFU060 memory query.");
+\t\t\t\tcpuRegs.GPR.n.a1.UL[0] = Ps2MemSize::ExposedRam - cpuRegs.GPR.n.a2.SL[0];
+\t\t\t}
+\t\t\tbreak;
+'''
+              s = s.replace(marker, block + marker)
+          if 'NCAA 128MB Android test: HLE GetMemorySize' not in s:
+              marker = '\n\n\t\tdefault:\n'
+              block = '''\t\tcase Syscall::GetMemorySize:
+\t\t\tif (memGetExtraMemMode())
+\t\t\t{
+\t\t\t\tConsole.Warning("NCAA 128MB Android test: HLE GetMemorySize -> ExposedRam.");
+\t\t\t\tcpuRegs.GPR.n.v0.UL[0] = Ps2MemSize::ExposedRam;
+\t\t\t\treturn;
+\t\t\t}
+\t\t\tbreak;
+
+'''
+              s = s.replace(marker, '\n' + block + '\t\tdefault:\n')
+          write(p, s)
+
+          # VMManager: hard-disable EE rec and fastmem where Android/settings re-apply CPU config.
+          p = Path('pcsx2/VMManager.cpp')
+          s = p.read_text()
+          if '#include "Memory.h"' not in s:
+              s = s.replace('#include "IopBios.h"\n', '#include "IopBios.h"\n#include "Memory.h"\n')
+          force = '''#ifdef ARCH_ARM64
+\tEmuConfig.Cpu.Recompiler.EnableEE = false;
+\tEmuConfig.Cpu.Recompiler.EnableFastmem = false;
+\tConsole.Warning("NCAA 128MB Android test: hard-forcing EE interpreter and fastmem off in VM CPU settings path.");
+#endif
+'''
+          # Insert into UpdateCPUImplementations() if present.
+          if 'hard-forcing EE interpreter and fastmem off in VM CPU settings path' not in s:
+              s, n = re.subn(r'(void VMManager::UpdateCPUImplementations\(\)\s*\{\n)', r'\1' + force, s, count=1)
+              if n == 0:
+                  # Fallback: insert just after the console line before CPU update if source moved.
+                  s = s.replace('Console.WriteLn("Updating CPU configuration...");\n', 'Console.WriteLn("Updating CPU configuration...");\n' + force)
+          # Insert into ApplyCoreSettings() too, because Android appears to re-merge settings after early allocation.
+          if 'hard-forcing EE interpreter and fastmem off in ApplyCoreSettings' not in s:
+              force2 = '''#ifdef ARCH_ARM64
+\tEmuConfig.Cpu.Recompiler.EnableEE = false;
+\tEmuConfig.Cpu.Recompiler.EnableFastmem = false;
+\tConsole.Warning("NCAA 128MB Android test: hard-forcing EE interpreter and fastmem off in ApplyCoreSettings.");
+#endif
+'''
+              s, n = re.subn(r'(void VMManager::ApplyCoreSettings\(\)\s*\{\n)', r'\1' + force2, s, count=1)
+              if n == 0:
+                  print('WARNING: ApplyCoreSettings() not found for extra insertion')
+          write(p, s)
+
+          # If Android logging marker exists in any native source, force immediately before it too.
+          for p in list(Path('pcsx2').rglob('*.cpp')) + list(Path('pcsx2').rglob('*.h')) + list(Path('android').rglob('*.cpp')) + list(Path('android').rglob('*.kt')):
+              try:
+                  s = p.read_text()
+              except UnicodeDecodeError:
+                  continue
+              if '@@CPU_BACKEND@@' in s and 'hard-forcing EE interpreter immediately before CPU_BACKEND log' not in s:
+                  s = s.replace('@@CPU_BACKEND@@', 'NCAA 128MB Android test: hard-forcing EE interpreter immediately before CPU_BACKEND log. @@CPU_BACKEND@@')
+                  # Native C++ log paths will also need the actual field set; if this lands in Kotlin, this text-only marker is harmless.
+                  p.write_text(s)
+
+          # Show the exact patched references in CI logs.
+          import subprocess
+          subprocess.run('grep -R "NCAA 128MB Android test" -n pcsx2 android || true', shell=True, check=True)
+          subprocess.run('grep -R "@@CPU_BACKEND@@\|@@ANDROID_CPU_CONFIG@@" -n . || true', shell=True, check=True)
+          PY
+          git diff -- pcsx2/Memory.cpp pcsx2/R5900.cpp pcsx2/R5900OpcodeImpl.cpp pcsx2/VMManager.cpp > "$GITHUB_WORKSPACE/armsx2-128mb-hardinterp.patch"
+          cat "$GITHUB_WORKSPACE/armsx2-128mb-hardinterp.patch"
+
+      - name: Build universal APK
+        run: |
+          set -eux
+          cd ARMSX2
+          ./tools/build-universal-page-apk.sh "$GITHUB_WORKSPACE/ARMSX2-128MB-HARDINTERP-universal-test.apk" --application-id com.armsx2.extmemhardinterp
+          sha256sum "$GITHUB_WORKSPACE/ARMSX2-128MB-HARDINTERP-universal-test.apk" | tee "$GITHUB_WORKSPACE/ARMSX2-128MB-HARDINTERP-universal-test.sha256"
+
+      - name: Collect artifact
+        run: |
+          ls -lh "$GITHUB_WORKSPACE"/ARMSX2-128MB-HARDINTERP-universal-test.apk "$GITHUB_WORKSPACE"/ARMSX2-128MB-HARDINTERP-universal-test.sha256 "$GITHUB_WORKSPACE"/ARMSX2_HEAD.txt "$GITHUB_WORKSPACE"/armsx2-128mb-hardinterp.patch
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ARMSX2-128MB-HARDINTERP-universal-test
+          path: |
+            ARMSX2-128MB-HARDINTERP-universal-test.apk
+            ARMSX2-128MB-HARDINTERP-universal-test.sha256
+            ARMSX2_HEAD.txt
+            armsx2-128mb-hardinterp.patch
